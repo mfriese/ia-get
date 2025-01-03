@@ -81,7 +81,7 @@ fn calculate_md5(file_path: &str) -> Result<String, std::io::Error> {
 }
 
 // Define the regular expression pattern for the expected format as a static constant
-static PATTERN: &str = r"^https:\/\/archive\.org\/details\/[a-zA-Z0-9_-]+$";
+static PATTERN: &str = r"^https:\/\/archive\.org\/details\/[a-zA-Z0-9_\-\.\+]+$";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -100,10 +100,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg(Arg::with_name("URL")
              .help("URL to an archive.org details page")
              .required(true)
-             .index(1))
+             .short('u')
+             .long("url")
+             .takes_value(true))
+        .arg(Arg::with_name("extension")
+             .help("File extension to download (e.g., mp4)")
+             .short('e')
+             .long("extension")
+             .takes_value(true)
+             .required(true))
         .get_matches();
 
     let details_url = matches.value_of("URL").ok_or("Missing URL argument")?;
+    let extension = matches.value_of("extension").ok_or("Missing extension argument")?;
 
     // Create a regex object with the static pattern
     let regex = Regex::new(PATTERN)?;
@@ -147,6 +156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for file in files.files {
         // Create a clone of the base URL
         let mut absolute_url = base_url.clone();
+
+        if !file.   name.ends_with(extension) {
+            println!("Skipping file: {}", file.name);
+            continue;
+        }
 
         // If the URL is relative, join it with the base_url to make it absolute
         match absolute_url.join(&file.name) {
