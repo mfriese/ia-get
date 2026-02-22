@@ -1,7 +1,7 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use md5;
 use regex::Regex;
-use reqwest::header::{HeaderValue, HeaderMap};
+use reqwest::header::{HeaderValue, HeaderMap, RANGE};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_xml_rs::from_str;
@@ -85,7 +85,11 @@ static PATTERN: &str = r"^https:\/\/archive\.org\/details\/[a-zA-Z0-9_\-\.\+]+$"
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::new();
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(120))
+        .build()?;
 
     let name = env!("CARGO_PKG_NAME");
     let version = env!("CARGO_PKG_VERSION");
@@ -209,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Set the Range header to specify the starting offset
-        let mut initial_request = client.get(absolute_url);
+        let mut initial_request = client.get(absolute_url.clone());
         let range_header = format!("bytes={}-", file_size);
         let mut headers = HeaderMap::new();
         headers.insert(reqwest::header::RANGE, HeaderValue::from_str(&range_header)?);
@@ -228,10 +232,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Download the remaining chunks and update the progress bar
         let mut total_bytes: u64 = file_size;
-        while let Some(chunk) = response.chunk().await? {
-            download.write_all(&chunk)?;
-            total_bytes += chunk.len() as u64;
-            pb.set_position(total_bytes);
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    download.write_all(&chunk)?;
+                    total_bytes += chunk.len() as u64;
+                    pb.set_position(total_bytes);
+                }
+                Ok(None) => break, // fertig
+                Err(_) => {
+                    
+                    println!("├╼ Connection lost ... retrying!");
+                    
+                    let range_header = format!("bytes={}-", total_bytes);
+                    let mut headers = HeaderMap::new();
+                    headers.insert(RANGE, HeaderValue::from_str(&range_header)?);
+        
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        
+                    response = client.get(absolute_url.clone())
+                        .headers(headers)
+                        .send()
+                        .await?;
+        
+                    continue;
+                }
+            }
         }
 
         pb.set_style(
