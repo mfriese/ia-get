@@ -1,281 +1,274 @@
-use indicatif::{ProgressBar, ProgressStyle};
-use md5;
-use regex::Regex;
-use reqwest::header::{HeaderValue, HeaderMap, RANGE};
+//! # ia-get
+//!
+//! A command-line tool for downloading files from the Internet Archive.
+//!
+//! This tool takes an archive.org details URL and downloads all associated files,
+//! with support for resumable downloads and MD5 hash verification.
+
+use clap::Parser;
+use colored::*;
+use ia_get::archive_metadata::{parse_xml_files, XmlFiles};
+use ia_get::constants::USER_AGENT;
+use ia_get::downloader;
+use ia_get::utils::{create_spinner, sanitize_filename, validate_archive_url};
+use ia_get::Result;
+use indicatif::ProgressStyle;
 use reqwest::Client;
-use serde::Deserialize;
-use serde_xml_rs::from_str;
-use clap::{App, Arg};
-use std::error::Error;
-use std::fs;
-use std::io::{Seek, Write};
-use std::process;
-use std::path::Path;
 
-#[derive(Deserialize, Debug)]
-struct XmlFiles {
-    #[serde(rename = "file")]
-    files: Vec<XmlFile>,
+/// Extended timeout for large file downloads (10 minutes for connection, no read timeout)
+const CONNECTION_TIMEOUT_SECS: u64 = 600;
+
+/// Checks if a URL is accessible by sending a HEAD request
+async fn is_url_accessible(url: &str, client: &Client) -> Result<()> {
+    let response = client
+        .head(url)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await?;
+
+    response.error_for_status()?;
+    Ok(())
 }
 
-#[allow(dead_code)]
-#[derive(Deserialize, Debug)]
-struct XmlFile {
-    #[serde(rename = "name")]
-    name: String,
-    #[serde(rename = "source")]
-    source: String,
-    #[serde(rename = "mtime")]
-    mtime: Option<u64>,
-    #[serde(rename = "size")]
-    size: Option<u64>,
-    #[serde(rename = "format")]
-    format: Option<String>,
-    #[serde(rename = "rotation")]
-    rotation: Option<u32>,
-    #[serde(rename = "md5")]
-    md5: Option<String>,
-    #[serde(rename = "crc32")]
-    crc32: Option<String>,
-    #[serde(rename = "sha1")]
-    sha1: Option<String>,
-    #[serde(rename = "btih")]
-    btih: Option<String>,
-    #[serde(rename = "summation")]
-    summation: Option<String>,
-    #[serde(rename = "original")]
-    original: Option<String>,
-    #[serde(rename = "old_version")]
-    old_version: Option<bool>,
-}
-
-async fn is_url_accessible(url: &str) -> Result<bool, Box<dyn Error>> {
-    let client = reqwest::Client::new();
-    let res = client.get(url).send().await;
-
-    match res {
-        Ok(response) => {
-            if response.status().is_success() {
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        },
-        Err(_) => Ok(false),
-    }
-}
-
+/// Converts a details URL to the corresponding XML files list URL
+///
+/// Takes an archive.org details URL and converts it to the XML metadata URL
+/// by replacing "details" with "download" and appending "_files.xml"
+///
+/// # Arguments
+/// * `original_url` - The archive.org details URL
+///
+/// # Returns
+/// The corresponding XML files list URL
 fn get_xml_url(original_url: &str) -> String {
-    let base_new_url = original_url.replacen("details", "download", 1);
-    if let Some(last_segment) = original_url.split('/').last() {
-        format!("{}/{}_files.xml", base_new_url, last_segment)
-    } else {
-        base_new_url
+    // Remove trailing slash if present to get a consistent base for identifier extraction
+    let trimmed_url = original_url.trim_end_matches('/');
+
+    // The identifier is the last segment of the trimmed URL
+    // This expect is considered safe because get_xml_url is only called after
+    // validate_archive_url has confirmed the URL structure.
+    let identifier = trimmed_url
+        .rsplit('/')
+        .next() // Changed from split().last() to address clippy warning
+        .expect("Validated URL should have a valid identifier segment after validation");
+
+    // The base URL for download is "https://archive.org/download/{identifier}"
+    let download_url_base = format!("https://archive.org/download/{}", identifier);
+
+    // The XML URL is "{download_url_base}/{identifier}_files.xml"
+    format!("{}/{}_files.xml", download_url_base, identifier)
+}
+
+/// Fetches and parses XML metadata from archive.org
+///
+/// Combines XML URL generation, accessibility check, download, and parsing
+/// into a single operation with integrated error handling.
+///
+/// # Arguments
+/// * `details_url` - The original archive.org details URL
+/// * `client` - HTTP client for requests
+/// * `spinner` - Progress spinner to update during processing
+///
+/// # Returns
+/// Tuple of (XmlFiles, base_url) for download processing
+async fn fetch_xml_metadata(
+    details_url: &str,
+    client: &Client,
+    spinner: &indicatif::ProgressBar,
+) -> Result<(XmlFiles, reqwest::Url)> {
+    // Generate XML URL
+    let xml_url = get_xml_url(details_url);
+    spinner.set_message(format!(
+        "{} Accessing XML metadata: {}",
+        "⚙".blue(),
+        xml_url.bold()
+    ));
+
+    // Check XML URL accessibility
+    if let Err(e) = is_url_accessible(&xml_url, client).await {
+        spinner.finish_with_message(format!(
+            "{} XML metadata not accessible: {}",
+            "✘".red().bold(),
+            xml_url.bold()
+        ));
+        return Err(e); // Propagate the error
     }
+
+    spinner.set_message(format!(
+        "{} {}",
+        "⚙".blue(),
+        "Parsing archive metadata...".bold()
+    ));
+
+    // Parse base URL and fetch XML content
+    let base_url = reqwest::Url::parse(&xml_url)?;
+    let response = client.get(&xml_url).send().await?;
+    let xml_content = response.text().await?;
+
+    // Parse XML content with improved error handling
+    let files = parse_xml_files(&xml_content)?;
+
+    Ok((files, base_url))
 }
 
-fn calculate_md5(file_path: &str) -> Result<String, std::io::Error> {
-    let file_contents = fs::read(file_path)?;
-    let hash = md5::compute(&file_contents);
-    Ok(format!("{:x}", hash))
+/// Command-line interface for ia-get
+#[derive(Parser)]
+#[command(name = "ia-get")]
+#[command(about = "A command-line tool for downloading files from the Internet Archive")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(author = env!("CARGO_PKG_AUTHORS"))]
+struct Cli {
+    /// URL to an archive.org details page
+    url: String,
 }
 
-// Define the regular expression pattern for the expected format as a static constant
-static PATTERN: &str = r"^https:\/\/archive\.org\/details\/[a-zA-Z0-9_\-\.\+]+$";
-
+/// Main application entry point
+///
+/// Parses command line arguments, validates the archive.org URL, checks URL accessibility,
+/// downloads XML metadata, and initiates file downloads with built-in signal handling.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    // Create a client with extended timeouts for large file downloads
+    // Connection timeout is set high, but no read timeout since large files
+    // may take a long time to transfer
     let client = Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
+        .user_agent(USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(CONNECTION_TIMEOUT_SECS))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(1)
         .tcp_keepalive(std::time::Duration::from_secs(60))
-        .pool_idle_timeout(std::time::Duration::from_secs(120))
         .build()?;
 
-    let name = env!("CARGO_PKG_NAME");
-    let version = env!("CARGO_PKG_VERSION");
-    let authors = env!("CARGO_PKG_AUTHORS");
-    let description = env!("CARGO_PKG_DESCRIPTION");
+    // Start a single spinner for the entire initialization process
+    let spinner = create_spinner(&format!("Processing archive.org URL: {}", cli.url.bold()));
 
-    // Parse command line arguments
-    let matches = App::new(name)
-        .version(version)
-        .author(authors)
-        .about(description)
-        .arg(Arg::with_name("URL")
-             .help("URL to an archive.org details page")
-             .required(true)
-             .short('u')
-             .long("url")
-             .takes_value(true))
-        .arg(Arg::with_name("extension")
-             .help("File extension to download (e.g., mp4)")
-             .short('e')
-             .long("extension")
-             .takes_value(true)
-             .required(true))
-        .get_matches();
-
-    let details_url = matches.value_of("URL").ok_or("Missing URL argument")?;
-    let extension = matches.value_of("extension").ok_or("Missing extension argument")?;
-
-    // Create a regex object with the static pattern
-    let regex = Regex::new(PATTERN)?;
-
-    println!("Archive.org URL: {}", details_url);
-    if !regex.is_match(details_url) {
-        println!("├╼ Archive.org URL is not in the expected format");
-        println!("╰╼ Expected format: https://archive.org/details/<identifier>/");
-        process::exit(1);
+    // Validate URL format using consolidated function
+    if let Err(e) = validate_archive_url(&cli.url) {
+        spinner.finish_with_message(format!("{} {}", "✘".red().bold(), e));
+        return Err(e.into());
     }
 
-    match is_url_accessible(details_url).await {
-        Ok(_) => println!("╰╼ Archive.org URL online: 🟢"),
-        Err(e) => {
-            println!("├╼ Archive.org URL online: 🔴");
-            panic!  ("╰╼ Exiting due to error: {}", e);
-        }
+    // Check URL accessibility
+    if let Err(e) = is_url_accessible(&cli.url, &client).await {
+        spinner.finish_with_message(format!(
+            "{} Archive.org URL not accessible: {}",
+            "✘".red().bold(),
+            cli.url.bold()
+        ));
+        return Err(e.into()); // Propagate error
     }
 
-    let xml_url = get_xml_url(details_url);
-    println!("Archive.org XML: {}", xml_url);
+    // Fetch and parse XML metadata in one operation
+    let (files, base_url) = fetch_xml_metadata(&cli.url, &client, &spinner).await?;
 
-    match is_url_accessible(&xml_url).await {
-        Ok(_) => println!("├╼ Archive.org XML online: 🟢"),
-        Err(e) => {
-            println!("├╼ Archive.org XML online: 🔴");
-            panic!  ("╰╼ Exiting due to error: {}", e);
-        }
-    }
+    // Successfully finished initialization
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template(&format!(
+                "{} {} to download {} files from archive.org {}",
+                "✔".green().bold(),
+                "Ready".bold(),
+                files.files.len().to_string().bold(),
+                "★".yellow()
+            ))
+            .expect("Failed to set completion style"),
+    );
+    spinner.finish();
 
-    println!("├╼ Parsing XML file        👀");
-    // Get the base URL from the XML URL
-    let base_url = reqwest::Url::parse(&xml_url)?;
-
-    // Download XML file
-    let response = reqwest::get(xml_url).await?.text().await?;
-    let files: XmlFiles = from_str(&response)?;
-    println!("╰╼ Done                    👍️");
-
-    // Iterate over the XML files struct and print every field
-    for file in files.files {
-        // Create a clone of the base URL
-        let mut absolute_url = base_url.clone();
-
-        if !file.   name.ends_with(extension) {
-            println!("Skipping file: {}", file.name);
-            continue;
-        }
-
-        // If the URL is relative, join it with the base_url to make it absolute
-        match absolute_url.join(&file.name) {
-            Ok(joined_url) => absolute_url = joined_url,
-            Err(_) => {} // If it's an error, it might already be an absolute URL. Ignore.
-        }
-        println!(" ");
-        println!("📦️ Filename     {}", file.name);
-        let mut download_action = "╰╼ Downloading  ";
-        let mut download_complete = "├╼ Downloading  ";
-
-        // Check if the file already exists
-        if Path::new(&file.name).exists() {
-            println!("├╼ Hash Check   🧮");
-            // Calculate the MD5 hash of the local file
-            let local_md5 = calculate_md5(&file.name).expect("╰╼ Failed to calculate MD5 hash");
-            let expected_md5 = file.md5.as_ref().unwrap();
-            if &local_md5 != expected_md5 {
-                download_action = "╰╼ Resuming     ";
-                download_complete = "├╼ Resuming     ";
-            } else {
-                println!("╰╼ Completed:   ✅");
-                continue;
+    // Prepare download data for batch processing
+    let mut sanitized_count = 0;
+    let download_data = files
+        .files
+        .into_iter()
+        .map(|file| {
+            let mut absolute_url = base_url.clone();
+            if let Ok(joined_url) = absolute_url.join(&file.name) {
+                absolute_url = joined_url;
             }
-        }
 
-        // Check if file.name includes a path
-        if let Some(path) = std::path::Path::new(&file.name).parent() {
-            // Create the local directory if it doesn't exist and path has a file name
-            if path.file_name().is_some() && !path.exists() {
-                fs::create_dir_all(path)?;
+            // Sanitize filename for filesystem compatibility
+            let (sanitized_name, was_modified) = sanitize_filename(&file.name);
+
+            // Warn user if filename was modified
+            if was_modified {
+                println!(
+                    "{} {} {} → {}",
+                    "⚠".yellow().bold(),
+                    "Sanitized:".yellow(),
+                    file.name.dimmed(),
+                    sanitized_name.bold()
+                );
+                sanitized_count += 1;
             }
-        }
 
-        // Create a new file for writing
-        let mut download = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(&file.name)?;
+            (absolute_url.to_string(), sanitized_name, file.md5)
+        })
+        .collect::<Vec<_>>();
 
-        // Get the size of the local file if it already exists
-        let file_size = download.metadata()?.len();
-        if file_size > 0 {
-            // Set the starting position for resuming the download
-            download.seek(std::io::SeekFrom::Start(file_size))?;
-        }
-
-        // Set the Range header to specify the starting offset
-        let mut initial_request = client.get(absolute_url.clone());
-        let range_header = format!("bytes={}-", file_size);
-        let mut headers = HeaderMap::new();
-        headers.insert(reqwest::header::RANGE, HeaderValue::from_str(&range_header)?);
-        initial_request = initial_request.headers(headers);
-
-        let mut response = initial_request.send().await?;
-
-        // Get the content length from the response headers
-        let content_length = response.content_length().unwrap_or(0);
-        let pb = ProgressBar::new(content_length + file_size);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(format!("{}{{elapsed_precise}}     {{bar:40.green/green}} {{bytes}}/{{total_bytes}} (ETA: {{eta}})", download_action).as_str()).expect("REASON")
-                .progress_chars("▓▒░"),
+    // Show summary if any files were sanitized
+    if sanitized_count > 0 {
+        println!(
+            "\n{} {} {} file{} for filesystem compatibility",
+            "✓".green().bold(),
+            "Sanitized".bold(),
+            sanitized_count.to_string().bold(),
+            if sanitized_count == 1 { "" } else { "s" }
         );
-
-        // Download the remaining chunks and update the progress bar
-        let mut total_bytes: u64 = file_size;
-        loop {
-            match response.chunk().await {
-                Ok(Some(chunk)) => {
-                    download.write_all(&chunk)?;
-                    total_bytes += chunk.len() as u64;
-                    pb.set_position(total_bytes);
-                }
-                Ok(None) => break, // fertig
-                Err(_) => {
-                    
-                    println!("├╼ Connection lost ... retrying!");
-                    
-                    let range_header = format!("bytes={}-", total_bytes);
-                    let mut headers = HeaderMap::new();
-                    headers.insert(RANGE, HeaderValue::from_str(&range_header)?);
-        
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        
-                    response = client.get(absolute_url.clone())
-                        .headers(headers)
-                        .send()
-                        .await?;
-        
-                    continue;
-                }
-            }
-        }
-
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(format!("{}{{elapsed_precise}}     {{bar:40.green/green}} {{total_bytes}}", download_complete).as_str()).expect("REASON")
-        );
-        pb.finish();
-
-        println!("├╼ Hash Check   🧮");
-        // Calculate the MD5 hash of the local file
-        let local_md5 = calculate_md5(&file.name).expect("╰╼ Failed to calculate MD5 hash");
-        let expected_md5 = file.md5.as_ref().unwrap();
-        if &local_md5 != expected_md5 {
-            println!("╰╼ Failure:     ❌");
-        } else {
-            println!("╰╼ Success:     ✅");
-        }
     }
+
+    // Download all files with integrated signal handling
+    downloader::download_files(&client, download_data.clone(), download_data.len()).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ia_get::utils::validate_archive_url;
+
+    #[test]
+    fn check_valid_pattern() {
+        assert!(validate_archive_url("https://archive.org/details/Valid-Pattern").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/Valid-Pattern/").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/test123").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/test123/").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/test_file-name.data").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/test_file-name.data/").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/user@domain").is_ok());
+        assert!(validate_archive_url("https://archive.org/details/user@domain/").is_ok());
+    }
+
+    #[test]
+    fn check_invalid_pattern() {
+        assert!(validate_archive_url("https://archive.org/details/Invalid-Pattern-*").is_err());
+        assert!(validate_archive_url("https://archive.org/details/").is_err()); // This should still be an error (empty identifier)
+        assert!(validate_archive_url("https://example.com/details/test").is_err());
+        assert!(validate_archive_url("http://archive.org/details/test").is_err());
+        assert!(validate_archive_url("https://archive.org/details/test/extra").is_err());
+        assert!(validate_archive_url("https://archive.org/details/test//").is_err());
+        // Multiple trailing slashes
+    }
+
+    #[test]
+    fn check_get_xml_url() {
+        assert_eq!(
+            get_xml_url("https://archive.org/details/item1"),
+            "https://archive.org/download/item1/item1_files.xml"
+        );
+        assert_eq!(
+            get_xml_url("https://archive.org/details/item1/"), // With trailing slash
+            "https://archive.org/download/item1/item1_files.xml"
+        );
+        assert_eq!(
+            get_xml_url("https://archive.org/details/another-item_v2.0"),
+            "https://archive.org/download/another-item_v2.0/another-item_v2.0_files.xml"
+        );
+        assert_eq!(
+            get_xml_url("https://archive.org/details/another-item_v2.0/"), // With trailing slash
+            "https://archive.org/download/another-item_v2.0/another-item_v2.0_files.xml"
+        );
+    }
 }
