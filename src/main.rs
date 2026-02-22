@@ -120,6 +120,9 @@ async fn fetch_xml_metadata(
 struct Cli {
     /// URL to an archive.org details page
     url: String,
+
+    #[arg(short, long)]
+    extension: Option<String>
 }
 
 /// Main application entry point
@@ -182,6 +185,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let download_data = files
         .files
         .into_iter()
+        .filter(|file| {
+        if let Some(ext) = &cli.extension {
+                file.name.ends_with(ext)
+            } else {
+                true // no extension filter
+            }
+        })
         .map(|file| {
             let mut absolute_url = base_url.clone();
             if let Ok(joined_url) = absolute_url.join(&file.name) {
